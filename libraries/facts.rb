@@ -491,6 +491,11 @@ class PhpFacts < Inspec.resource(1)
     facts[:overrides].fetch(key) { facts[:ini][key] }
   end
 
+  # php -r could read the ini settings at all
+  def ini_readable?
+    !facts[:ini].empty?
+  end
+
   # Boolean ini setting (On/1/true/yes)
   def ini_on?(key)
     %w[1 on true yes].include?(ini(key).to_s.strip.downcase)

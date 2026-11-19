@@ -113,6 +113,7 @@ When a vendor ships a fix for a CVE you could previously only mitigate, add the 
 | PHP | CVE-2026-109618 | 9.2 | request memory corruption RCE (PHP2Shell) |
 | PHP | CVE-2026-109619 | 9.2 | stale global state RCE (PHP2Shell) |
 | PHP | CVE-2026-115560 | n/a | session serializer mismatch RCE |
+| PHP | CVE-2026-126714 | 9.2 | partially overwritten session files RCE |
 | Node.js | CVE-2026-105482 | 7.4 | DNS hostname truncation at NUL |
 | Node.js | CVE-2026-105483 | n/a | TLS Unicode hostname validation bypass |
 | Node.js | CVE-2026-106069 | 7.4 | TLS hostname verification bypass |
