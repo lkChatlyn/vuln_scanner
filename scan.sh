@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the vuln-rules profile against this host and every running container,
-# then print one line per target and CVE, worst first.
+# then print the results grouped per container / host, worst first.
 #
 # Exit code: 0 = everything PATCHED / MITIGATED / N/A / SKIPPED
 #            1 = at least one VULN, PARTIALLY_MITIGATED, UNKNOWN or ERROR
@@ -9,11 +9,12 @@ set -uo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 [-p profile] [-o outdir] [-j jobs] [-n] [-a] [-k] [-v]
+Usage: $0 [-p profile] [-o outdir] [-j jobs] [-n] [-d] [-a] [-k] [-v]
   -p  profile path or git URL (default: the directory this script is in)
   -o  report directory (default: <script dir>/reports/<timestamp>)
   -j  targets to scan in parallel (default: 4; each needs ~150-200 MB RAM)
   -n  skip the host, scan containers only
+  -d  also list MITIGATED / PATCHED results (by default only counted per target)
   -a  also list N/A results (product not present)
   -k  keep the raw JSON report per target (large; deleted by default)
   -v  also print Cinc Auditor's full output per target
@@ -26,14 +27,16 @@ OUT="$SCRIPT_DIR/reports/$(date +%Y%m%d-%H%M%S)"
 JOBS=4
 SCAN_HOST=1
 SHOW_NA=0
+SHOW_ALL=0
 KEEP_JSON=0
 VERBOSE=0
-while getopts 'p:o:j:nakvh' opt; do
+while getopts 'p:o:j:ndakvh' opt; do
   case $opt in
     p) PROFILE=$OPTARG ;;
     o) OUT=$OPTARG ;;
     j) JOBS=$OPTARG ;;
     n) SCAN_HOST=0 ;;
+    d) SHOW_ALL=1 ;;
     a) SHOW_NA=1 ;;
     k) KEEP_JSON=1 ;;
     v) VERBOSE=1 ;;
@@ -51,18 +54,49 @@ done
 mkdir -p "$OUT"
 : > "$OUT/extra.tsv"
 
-# Targets as "name|target". Swarm task names carry 25-character task and node
-# IDs (web.1.olm76dous69alhgqa8m5pv2v8); drop them so the table stays readable.
+# Targets as "name|target". Replicas of the same deployment run the same image
+# with the same config, so only one of them is scanned and listed:
+#   - Swarm service    (label com.docker.swarm.service.name) + image
+#   - Compose service  (labels com.docker.compose.project/.service) + image
+# The name then becomes e.g. "windmill_worker (3 replicas)". Replicas on
+# different images (mid rolling update) stay separate. Other containers are
+# scanned one by one, even with the same image, since their config can differ.
+# Remaining Swarm task/node IDs (web.1.olm76dous69alhgqa8m5pv2v8) are dropped
+# from names so the table stays readable.
 targets=()
 [ "$SCAN_HOST" = 1 ] && targets+=("_host|local://")
-while read -r id name; do
-  short=$(printf '%s' "$name" | sed -E 's/\.[a-z0-9]{25}//g')
+ids=$(docker ps -q)
+if [ -n "$ids" ]; then
+  # shellcheck disable=SC2086
+  docker inspect -f '{{.Id}}|{{.Name}}|{{.Image}}|{{index .Config.Labels "com.docker.swarm.service.name"}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' $ids
+fi | awk -F'|' '
+  function set(v) { return v != "" && v != "<no value>" }
+  {
+    id = substr($1, 1, 12); name = $2; sub(/^\//, "", name)
+    img = $3; sub(/^sha256:/, "", img); img = substr(img, 1, 12)
+    if (set($4))      { key = "s|" $4 "|" img; label = $4 }
+    else if (set($6)) { key = "c|" $5 "|" $6 "|" img; label = (set($5) ? $5 "-" : "") $6 }
+    else              { key = "i|" id; label = name; gsub(/\.[a-z0-9]{25}/, "", label) }
+    if (!(key in rep)) { rep[key] = id; lab[key] = label; kind[key] = substr(key, 1, 1); order[++n] = key; uses[label]++ }
+    cnt[key]++
+  }
+  END {
+    for (i = 1; i <= n; i++) {
+      k = order[i]; l = lab[k]
+      if (uses[l] > 1 && kind[k] != "i") { split(k, p, "|"); l = l " img " p[length(p)] }
+      if (cnt[k] > 1) l = l " (" cnt[k] " replicas)"
+      print l "\t" rep[k]
+    }
+  }' > "$OUT/targets.tsv"
+
+while IFS=$'\t' read -r short id; do
   # Keep names unique, since they are also report file names
   if printf '%s\n' "${targets[@]:-}" | cut -d'|' -f1 | grep -qxF "$short"; then
     short="$short.${id:0:6}"
   fi
   targets+=("$short|docker://$id")
-done < <(docker ps --format '{{.ID}} {{.Names}}')
+done < "$OUT/targets.tsv"
+rm -f "$OUT/targets.tsv"
 [ "${#targets[@]}" -gt 0 ] || { echo "nothing to scan" >&2; exit 0; }
 
 # Scan one "name|target". Runs in parallel, so each target writes only its own
@@ -139,34 +173,57 @@ rm -f "$OUT/extra.tsv"
 if [ -t 1 ]; then RED=$'\e[31m'; YEL=$'\e[33m'; MAG=$'\e[35m'; GRN=$'\e[32m'; DIM=$'\e[2m'; RST=$'\e[0m'
 else RED=''; YEL=''; MAG=''; GRN=''; DIM=''; RST=''; fi
 
+# Grouped by target, worst target first. Problem rows (VULN, PARTIALLY_MITIGATED,
+# UNKNOWN, ERROR, SKIPPED) are always listed; MITIGATED / PATCHED only with -d,
+# N/A only with -a. Targets where no rule applies are left out (see totals).
 echo
 awk -F'\t' -v na="$SHOW_NA" '
-  BEGIN { r["VULN"]=0; r["UNKNOWN"]=1; r["ERROR"]=2; r["PARTIALLY_MITIGATED"]=3; r["MITIGATED"]=4; r["PATCHED"]=5; r["SKIPPED"]=6; r["N/A"]=7 }
+  BEGIN { n = split("VULN UNKNOWN ERROR PARTIALLY_MITIGATED SKIPPED MITIGATED PATCHED N/A", o, " ")
+          for (i = 1; i <= n; i++) r[o[i]] = i }
   $3 == "N/A" && na != 1 { next }
-  { print r[$3] "\t" $0 }' "$OUT/summary.tsv" \
-  | sort -t $'\t' -k1,1n -k3,3 -k2,2 \
-  | cut -f2- \
-  | awk -F'\t' -v red="$RED" -v yel="$YEL" -v mag="$MAG" -v grn="$GRN" -v dim="$DIM" -v rst="$RST" '
-      { n++; t[n]=$1; c[n]=$2; s[n]=$3; d[n]=$4
-        if (length($1) > w1) w1 = length($1); if (length($2) > w2) w2 = length($2); if (length($3) > w3) w3 = length($3) }
-      END {
-        if (n == 0) { print "Nothing to report: no rule applies to any target (use -a to see N/A)."; exit }
-        if (w1 < 6) w1 = 6; if (w2 < 3) w2 = 3; if (w3 < 5) w3 = 5
-        fmt = "%-" w1 "s  %-" w2 "s  %s%-" w3 "s%s  %s\n"
-        printf fmt, "TARGET", "CVE", "", "STATE", "", "DETAIL"
-        for (i = 1; i <= n; i++) {
-          col = (s[i] == "VULN") ? red : (s[i] == "PARTIALLY_MITIGATED") ? yel : (s[i] == "UNKNOWN" || s[i] == "ERROR") ? mag : (s[i] == "SKIPPED" || s[i] == "N/A") ? dim : grn
-          printf fmt, t[i], c[i], col, s[i], rst, d[i]
+  NR == FNR { if (!($1 in worst) || r[$3] < worst[$1]) worst[$1] = r[$3]; next }
+  { print worst[$1] "\t" $1 "\t" r[$3] "\t" $2 "\t" $3 "\t" $4 }' "$OUT/summary.tsv" "$OUT/summary.tsv" \
+  | sort -t $'\t' -k1,1n -k2,2 -k3,3n -k4,4 \
+  | awk -F'\t' -v all="$SHOW_ALL" -v red="$RED" -v yel="$YEL" -v mag="$MAG" -v grn="$GRN" -v dim="$DIM" -v rst="$RST" '
+      function color(st) {
+        return (st == "VULN") ? red : (st == "PARTIALLY_MITIGATED") ? yel : (st == "UNKNOWN" || st == "ERROR") ? mag : (st == "SKIPPED" || st == "N/A") ? dim : grn
+      }
+      function flush(   i, line, st, safe) {
+        if (cur == "") return
+        line = ""; safe = 1
+        for (i = 1; i <= no; i++) {
+          st = o[i]
+          if (cnt[st]) line = line (line == "" ? "" : ", ") cnt[st] " " st
+          if (cnt[st] && st != "MITIGATED" && st != "PATCHED" && st != "N/A") safe = 0
         }
+        name = (cur == "_host") ? "Docker host" : cur
+        printf "%s%s%s  %s%s\n", color(first), name, rst, line, safe ? "  " grn "ok" rst : ""
+        for (i = 1; i <= m; i++) print rows[i]
+        print ""
+        m = 0; split("", cnt); shown++
+      }
+      BEGIN { no = split("VULN PARTIALLY_MITIGATED UNKNOWN ERROR SKIPPED MITIGATED PATCHED N/A", o, " ") }
+      {
+        if ($2 != cur) { flush(); cur = $2; first = $5 }
+        cnt[$5]++
+        problem = ($5 != "MITIGATED" && $5 != "PATCHED" && $5 != "N/A")
+        if (problem || all == 1 || $5 == "N/A") {
+          if ($4 == "-") rows[++m] = sprintf("    %s%-19s%s  %s", color($5), $5, rst, $6)
+          else rows[++m] = sprintf("    %s%-19s%s  %-20s  %s", color($5), $5, rst, $4, $6)
+        }
+      }
+      END {
+        flush()
+        if (shown == 0) print "Nothing to report: no rule applies to any target (use -a to see N/A)."
       }'
 
 # Totals, so the big picture fits on one line
-echo
-awk -F'\t' -v n="${#targets[@]}" '
+containers=$(printf '%s\n' $ids | grep -c .)
+awk -F'\t' -v n="${#targets[@]}" -v c="$containers" -v host="$SCAN_HOST" '
   { seen[$1] = 1; if ($3 != "N/A") relevant[$1] = 1; if ($3 != "N/A") cnt[$3]++ }
   END {
     for (t in seen) if (!(t in relevant)) unaffected++
-    line = n " targets"
+    line = n " targets (" c " containers" (host == 1 ? " + host" : "") ", one replica per service)"
     split("VULN PARTIALLY_MITIGATED UNKNOWN ERROR MITIGATED PATCHED SKIPPED", order, " ")
     for (i = 1; i <= 7; i++) if (cnt[order[i]]) line = line ", " cnt[order[i]] " " order[i]
     if (unaffected) line = line ", " unaffected " with no affected software"

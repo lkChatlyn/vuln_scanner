@@ -30,19 +30,30 @@ sudo /opt/vuln_scanner/scan.sh
 ```
 
 ```
-TARGET                 CVE              STATE      DETAIL
-shop_app.1             CVE-2026-115560  VULN       PHP 8.4.27, upload_progress on, serialize_handler=php_serialize
-proxy_web.1            CVE-2026-123007  MITIGATED  nginx 1.28.1, HTTP/2 and HTTP/3 disabled
-portainer_agent        -                SKIPPED    no shell in container (distroless/scratch image), cannot be checked
+Docker host  1 VULN, 1 PARTIALLY_MITIGATED, 1 MITIGATED
+    VULN                 CVE-2026-98432        kernel 6.1.180, distro package older than the fixed one
+    PARTIALLY_MITIGATED  CVE-2026-80844        kernel 6.1.180, unprivileged user namespaces disabled; upgrade to remove the remaining risk
 
-12 targets, 1 VULN, 1 MITIGATED, 1 SKIPPED, 9 with no affected software
+shop_app (3 replicas)  1 VULN, 1 PARTIALLY_MITIGATED, 1 MITIGATED
+    VULN                 CVE-2026-109618       PHP 8.4.20, fixed in 8.4.27
+    PARTIALLY_MITIGATED  CVE-2026-109619       PHP 8.4.20, session.upload_progress.enabled=0; upgrade to remove the remaining risk
+
+portainer_agent  1 SKIPPED
+    SKIPPED              no shell in container (distroless/scratch image), cannot be checked
+
+proxy_web  9 MITIGATED, 2 PATCHED  ok
+
+12 targets (19 containers + host, one replica per service), 2 VULN, 2 PARTIALLY_MITIGATED, 10 MITIGATED, 2 PATCHED, 1 SKIPPED, 8 with no affected software
 ```
 
-Swarm task IDs are dropped from container names (`web.1.olm76d…` becomes `web.1`).
+Results are grouped per container and host, worst first. Each header line counts the results for that target. VULN, PARTIALLY_MITIGATED, UNKNOWN, ERROR and SKIPPED are always listed. MITIGATED and PATCHED results are only counted (use `-d` to list them), and targets where no rule applies are left out.
+
+Replicas are scanned and listed once. Containers of the same Swarm service or Compose service that run the same image are one target, shown as e.g. `windmill_worker (3 replicas)`, and only one replica is scanned. Replicas on a different image, for example halfway through a rolling update, stay separate (`windmill_worker img 1a2b3c4d5e6f`). Other containers are scanned one by one even when they share an image, because their config can differ.
 
 Options:
 - `-j <n>`: scan n targets in parallel (default 4). Each target takes about 2 s, mostly Cinc Auditor's startup time. Each parallel job needs about 150–200 MB of RAM.
 - `-n`: containers only, skip the host (also skips the kernel and Go rules, see below)
+- `-d`: also list MITIGATED and PATCHED results, with the reason
 - `-a`: also list N/A results
 - `-v`: print Cinc Auditor's full output
 - `-p <git-url>`: run rules from a repo without cloning it
