@@ -1,3 +1,7 @@
+# Helpers for CVE rules. Cinc Auditor loads library files into a private
+# namespace, so plain Ruby modules defined here are not visible from
+# controls. Everything shared is therefore a custom resource.
+
 # Three-state result for a CVE check.
 #
 #   describe cve_state(:mitigated, 'HTTP/2 disabled') do
@@ -36,20 +40,31 @@ class CveState < Inspec.resource(1)
   end
 end
 
-module VersionCheck
-  # True if +version+ is at least the fixed release for its branch.
-  #
-  #   VersionCheck.patched?('8.4.28', '8.4' => '8.4.28', '8.3' => '8.3.37')  # => true
-  #
-  # A branch missing from +fixed+ (end of life, or no fix released yet)
-  # counts as not patched.
-  def self.patched?(version, fixed)
-    branch = version.to_s[/\A\d+\.\d+/]
-    min = fixed[branch]
+# Is a version at least the fixed release for its branch?
+#
+#   version_check('8.4.28', '8.4' => '8.4.28', '8.3' => '8.3.37').patched?  # => true
+#
+# A branch missing from the list (end of life, or no fix released yet)
+# counts as not patched.
+class VersionCheck < Inspec.resource(1)
+  name 'version_check'
+  desc 'Compare a version against the fixed release per branch'
+
+  def initialize(version, fixed)
+    @version = version.to_s
+    @fixed = fixed
+  end
+
+  def patched?
+    min = @fixed[@version[/\A\d+\.\d+/]]
     return false if min.nil?
 
-    Gem::Version.new(version) >= Gem::Version.new(min)
+    Gem::Version.new(@version) >= Gem::Version.new(min)
   rescue ArgumentError
     false
+  end
+
+  def to_s
+    "version #{@version}"
   end
 end
