@@ -1,0 +1,7 @@
+name: vuln-rules
+title: Vulnerability checks
+summary: Version, config and module checks that rate each CVE as PATCHED, MITIGATED or VULN
+version: 0.1.0
+license: proprietary
+supports:
+  - platform: unix
