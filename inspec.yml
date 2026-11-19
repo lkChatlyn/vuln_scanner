@@ -5,3 +5,9 @@ version: 0.1.0
 license: proprietary
 supports:
   - platform: unix
+inputs:
+  # Set by scan.sh: "host" for the Docker host itself, "container" otherwise.
+  # Kernel and Go rules run on the host only (containers share the host kernel,
+  # and the host sees every container's processes).
+  - name: target_kind
+    value: container

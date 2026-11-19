@@ -3,7 +3,7 @@
 # then print one line per target and CVE, worst first.
 #
 # Exit code: 0 = everything PATCHED / MITIGATED / N/A / SKIPPED
-#            1 = at least one VULN, UNKNOWN or ERROR
+#            1 = at least one VULN, PARTIALLY_MITIGATED, UNKNOWN or ERROR
 #            2 = usage or missing tool
 set -uo pipefail
 
@@ -83,11 +83,14 @@ scan_one() {
       ;;
   esac
 
+  local kind=container
+  [ "$target" = local:// ] && kind=host
+
   echo "scanning $name" >&2
   if [ "$VERBOSE" = 1 ]; then
-    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter cli "json:$report" >"$log" 2>&1
+    cinc-auditor exec "$PROFILE" -t "$target" --no-color --input "target_kind=$kind" --reporter cli "json:$report" >"$log" 2>&1
   else
-    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter "json:$report" >/dev/null 2>"$log"
+    cinc-auditor exec "$PROFILE" -t "$target" --no-color --input "target_kind=$kind" --reporter "json:$report" >/dev/null 2>"$log"
   fi
   rc=$?
 
@@ -124,7 +127,7 @@ for f in "$OUT"/*.json; do
     if $r.status == "skipped" then
       [$t, $id, "N/A", (($r.skip_message // "") | sub("^Skipped control due to only_if condition: "; ""))]
     else
-      (($r.code_desc | capture("^(?<s>[A-Z]+): (?<r>.*?) (is expected|should)"))
+      (($r.code_desc | capture("^(?<s>[A-Z_]+): (?<r>.*?) (is expected|should)"))
         // {s: "ERROR", r: ($r.message // $r.code_desc)}) as $m
       | [$t, $id, $m.s, ($m.r | gsub("[\t\n]"; " "))]
     end | @tsv' "$f"
@@ -133,26 +136,26 @@ cat "$OUT/extra.tsv" >> "$OUT/summary.tsv"
 rm -f "$OUT/extra.tsv"
 [ "$KEEP_JSON" = 1 ] || rm -f "$OUT"/*.json
 
-if [ -t 1 ]; then RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'; DIM=$'\e[2m'; RST=$'\e[0m'
-else RED=''; YEL=''; GRN=''; DIM=''; RST=''; fi
+if [ -t 1 ]; then RED=$'\e[31m'; YEL=$'\e[33m'; MAG=$'\e[35m'; GRN=$'\e[32m'; DIM=$'\e[2m'; RST=$'\e[0m'
+else RED=''; YEL=''; MAG=''; GRN=''; DIM=''; RST=''; fi
 
 echo
 awk -F'\t' -v na="$SHOW_NA" '
-  BEGIN { r["VULN"]=0; r["UNKNOWN"]=1; r["ERROR"]=2; r["MITIGATED"]=3; r["PATCHED"]=4; r["SKIPPED"]=5; r["N/A"]=6 }
+  BEGIN { r["VULN"]=0; r["UNKNOWN"]=1; r["ERROR"]=2; r["PARTIALLY_MITIGATED"]=3; r["MITIGATED"]=4; r["PATCHED"]=5; r["SKIPPED"]=6; r["N/A"]=7 }
   $3 == "N/A" && na != 1 { next }
   { print r[$3] "\t" $0 }' "$OUT/summary.tsv" \
   | sort -t $'\t' -k1,1n -k3,3 -k2,2 \
   | cut -f2- \
-  | awk -F'\t' -v red="$RED" -v yel="$YEL" -v grn="$GRN" -v dim="$DIM" -v rst="$RST" '
+  | awk -F'\t' -v red="$RED" -v yel="$YEL" -v mag="$MAG" -v grn="$GRN" -v dim="$DIM" -v rst="$RST" '
       { n++; t[n]=$1; c[n]=$2; s[n]=$3; d[n]=$4
-        if (length($1) > w1) w1 = length($1); if (length($2) > w2) w2 = length($2) }
+        if (length($1) > w1) w1 = length($1); if (length($2) > w2) w2 = length($2); if (length($3) > w3) w3 = length($3) }
       END {
         if (n == 0) { print "Nothing to report: no rule applies to any target (use -a to see N/A)."; exit }
-        if (w1 < 6) w1 = 6; if (w2 < 3) w2 = 3
-        fmt = "%-" w1 "s  %-" w2 "s  %s%-9s%s  %s\n"
+        if (w1 < 6) w1 = 6; if (w2 < 3) w2 = 3; if (w3 < 5) w3 = 5
+        fmt = "%-" w1 "s  %-" w2 "s  %s%-" w3 "s%s  %s\n"
         printf fmt, "TARGET", "CVE", "", "STATE", "", "DETAIL"
         for (i = 1; i <= n; i++) {
-          col = (s[i] == "VULN") ? red : (s[i] == "UNKNOWN" || s[i] == "ERROR") ? yel : (s[i] == "SKIPPED" || s[i] == "N/A") ? dim : grn
+          col = (s[i] == "VULN") ? red : (s[i] == "PARTIALLY_MITIGATED") ? yel : (s[i] == "UNKNOWN" || s[i] == "ERROR") ? mag : (s[i] == "SKIPPED" || s[i] == "N/A") ? dim : grn
           printf fmt, t[i], c[i], col, s[i], rst, d[i]
         }
       }'
@@ -164,14 +167,14 @@ awk -F'\t' -v n="${#targets[@]}" '
   END {
     for (t in seen) if (!(t in relevant)) unaffected++
     line = n " targets"
-    split("VULN UNKNOWN ERROR MITIGATED PATCHED SKIPPED", order, " ")
-    for (i = 1; i <= 6; i++) if (cnt[order[i]]) line = line ", " cnt[order[i]] " " order[i]
+    split("VULN PARTIALLY_MITIGATED UNKNOWN ERROR MITIGATED PATCHED SKIPPED", order, " ")
+    for (i = 1; i <= 7; i++) if (cnt[order[i]]) line = line ", " cnt[order[i]] " " order[i]
     if (unaffected) line = line ", " unaffected " with no affected software"
     print line
   }' "$OUT/summary.tsv"
 echo "scanned in $(( $(date +%s) - start ))s ($JOBS parallel), summary: $OUT/summary.tsv" >&2
 
-if awk -F'\t' '$3 == "VULN" || $3 == "UNKNOWN" || $3 == "ERROR" { bad=1 } END { exit !bad }' "$OUT/summary.tsv"; then
+if awk -F'\t' '$3 == "VULN" || $3 == "PARTIALLY_MITIGATED" || $3 == "UNKNOWN" || $3 == "ERROR" { bad=1 } END { exit !bad }' "$OUT/summary.tsv"; then
   exit 1
 fi
 exit 0
