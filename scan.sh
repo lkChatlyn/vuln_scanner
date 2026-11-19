@@ -9,9 +9,10 @@ set -uo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 [-p profile] [-o outdir] [-n] [-a] [-v]
+Usage: $0 [-p profile] [-o outdir] [-j jobs] [-n] [-a] [-v]
   -p  profile path or git URL (default: the directory this script is in)
   -o  report directory (default: ./reports/<timestamp>)
+  -j  targets to scan in parallel (default: 4; each needs ~150-200 MB RAM)
   -n  skip the host, scan containers only
   -a  also list N/A results (product not present)
   -v  also print Cinc Auditor's full output per target
@@ -20,13 +21,15 @@ EOF
 
 PROFILE="$(cd "$(dirname "$0")" && pwd)"
 OUT="./reports/$(date +%Y%m%d-%H%M%S)"
+JOBS=4
 SCAN_HOST=1
 SHOW_NA=0
 VERBOSE=0
-while getopts 'p:o:navh' opt; do
+while getopts 'p:o:j:navh' opt; do
   case $opt in
     p) PROFILE=$OPTARG ;;
     o) OUT=$OPTARG ;;
+    j) JOBS=$OPTARG ;;
     n) SCAN_HOST=0 ;;
     a) SHOW_NA=1 ;;
     v) VERBOSE=1 ;;
@@ -34,6 +37,9 @@ while getopts 'p:o:navh' opt; do
     *) usage; exit 2 ;;
   esac
 done
+case $JOBS in
+  ''|*[!0-9]*|0) echo "-j needs a positive number" >&2; exit 2 ;;
+esac
 
 for bin in cinc-auditor docker jq; do
   command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 2; }
@@ -47,30 +53,45 @@ targets=()
 while read -r id name; do
   targets+=("$name|docker://$id")
 done < <(docker ps --format '{{.ID}} {{.Names}}')
+[ "${#targets[@]}" -gt 0 ] || { echo "nothing to scan" >&2; exit 0; }
 
-for t in "${targets[@]}"; do
-  name=${t%%|*}
-  target=${t#*|}
-  report="$OUT/$name.json"
+# Scan one "name|target". Runs in parallel, so each target writes only its own
+# files; errors.tsv gets one short appended line, which is safe to share.
+scan_one() {
+  local name=${1%%|*} target=${1#*|}
+  local report="$OUT/$name.json" log="$OUT/$name.log" rc msg
   echo "scanning $name" >&2
 
   if [ "$VERBOSE" = 1 ]; then
-    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter cli "json:$report" >&2
+    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter cli "json:$report" >"$log" 2>&1
   else
-    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter "json:$report" >/dev/null 2>"$OUT/$name.err"
+    cinc-auditor exec "$PROFILE" -t "$target" --no-color --reporter "json:$report" >/dev/null 2>"$log"
   fi
   rc=$?
 
   # 0 = all passed, 100 = some failed, 101 = some skipped; anything else is a crash
   case $rc in
-    0|100|101) rm -f "$OUT/$name.err" ;;
+    0|100|101) [ "$VERBOSE" = 1 ] || rm -f "$log" ;;
     *)
-      msg=$(tail -n 1 "$OUT/$name.err" 2>/dev/null)
+      msg=$(tail -n 1 "$log" 2>/dev/null)
       printf '%s\t-\tERROR\tcinc-auditor exit %s %s\n' "$name" "$rc" "$msg" >> "$OUT/errors.tsv"
       rm -f "$report"
       ;;
   esac
-done
+}
+export -f scan_one
+export OUT PROFILE VERBOSE
+
+start=$(date +%s)
+printf '%s\n' "${targets[@]}" | xargs -P "$JOBS" -I{} bash -c 'scan_one "$1"' _ {}
+
+if [ "$VERBOSE" = 1 ]; then
+  for t in "${targets[@]}"; do
+    name=${t%%|*}
+    printf '\n===== %s =====\n' "$name" >&2
+    cat "$OUT/$name.log" >&2 2>/dev/null
+  done
+fi
 
 # One TSV row per result: target, CVE, state, reason
 for f in "$OUT"/*.json; do
@@ -105,7 +126,7 @@ awk -F'\t' -v na="$SHOW_NA" '
       }'
 
 echo
-echo "${#targets[@]} targets scanned, reports in $OUT" >&2
+echo "${#targets[@]} targets scanned in $(( $(date +%s) - start ))s ($JOBS parallel), reports in $OUT" >&2
 
 if awk -F'\t' '$3 == "VULN" || $3 == "UNKNOWN" || $3 == "ERROR" { bad=1 } END { exit !bad }' "$OUT/summary.tsv"; then
   exit 1

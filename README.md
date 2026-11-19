@@ -35,6 +35,7 @@ blog-php                         CVE-2026-115560  MITIGATED  PHP 8.3.36, session
 ```
 
 Options:
+- `-j <n>`: scan n targets in parallel (default 4). Each target takes about 2 s, mostly Cinc Auditor's startup time. Each parallel job needs about 150–200 MB of RAM.
 - `-n`: containers only, skip the host
 - `-a`: also list N/A results
 - `-v`: print Cinc Auditor's full output
