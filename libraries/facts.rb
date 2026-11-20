@@ -795,7 +795,10 @@ class RailsFacts < Inspec.resource(1)
 end
 
 # Go binaries of all running processes. On the host this includes every
-# container's processes (also distroless ones), labelled by container name.
+# container's processes (also distroless ones without a shell). Each binary
+# carries the container it runs in (first 12 characters of the container ID,
+# nil for host processes), so results can be reported per container; host
+# binaries carry the package that installed them (e.g. docker-ce).
 class GoFacts < Inspec.resource(1)
   name 'go_facts'
   desc 'Go toolchain version embedded in running binaries'
@@ -805,33 +808,28 @@ class GoFacts < Inspec.resource(1)
     !binaries.empty?
   end
 
-  # [{ label:, exe:, go: '1.25.3', xnet: '0.44.0' or nil, xnet_http2: bool,
-  #    godebug: 'http2server=0' or '' }, ...]
+  # [{ container: 'a1b2c3d4e5f6' or nil, label: 'dockerd (docker-ce)', exe:,
+  #    go: '1.25.3', xnet: '0.44.0' or nil, xnet_http2: bool, godebug: '' }, ...]
   # xnet_http2: the binary uses golang.org/x/net/http2 directly (e.g. gRPC),
   # which GODEBUG http2server=0 does not switch off.
   def binaries
     facts[:binaries]
   end
 
-  # [[label, version], ...] for cve_eval
-  def go_versions
-    binaries.map { |b| [b[:label], b[:go]] }.uniq
-  end
-
-  def xnet_versions
-    binaries.select { |b| b[:xnet] }.map { |b| [b[:label], b[:xnet]] }.uniq
+  # Binaries grouped by container (nil = host)
+  def by_container
+    binaries.group_by { |b| b[:container] }
   end
 
   private
 
   def read_facts
     out = sh(<<~'SH')
-      names=$(docker ps --no-trunc --format '{{.ID}} {{.Names}}' 2>/dev/null)
       for p in /proc/[0-9]*; do
         e=$(readlink "$p/exe" 2>/dev/null) || continue
         case $e in *' (deleted)') continue ;; esac
         cid=$(grep -oE '[0-9a-f]{64}' "$p/cgroup" 2>/dev/null | head -n 1)
-        echo "$cid $p/exe $e"
+        echo "${cid:--} $p/exe $e"
       done | sort -u -k1,1 -k3,3 | while read -r cid path e; do
         v=$(LC_ALL=C grep -aoE 'go1\.[0-9]+\.[0-9]+' "$path" 2>/dev/null | sort | uniq -c | sort -rn | head -n 1 | awk '{print $2}')
         [ -n "$v" ] || continue
@@ -839,15 +837,20 @@ class GoFacts < Inspec.resource(1)
         h=0; LC_ALL=C grep -aq 'golang\.org/x/net/http2\.' "$path" 2>/dev/null && h=1
         pid=${path%/exe}
         d=$(tr '\0' '\n' < "$pid/environ" 2>/dev/null | sed -n 's/^GODEBUG=//p' | head -n 1)
-        n=host
-        [ -n "$cid" ] && n=$(printf '%s\n' "$names" | awk -v id="$cid" '$1 == id {print $2}' | sed -E 's/\.[a-z0-9]{25}//g')
-        [ -n "$n" ] || n=${cid:-host}
-        echo "BIN $n|$e|$v|$x|$h|$d"
+        pkg=
+        if [ "$cid" = - ]; then
+          pkg=$( { dpkg -S "$e" 2>/dev/null | head -n 1 | cut -d: -f1; } || true)
+          [ -n "$pkg" ] || pkg=$(rpm -qf --qf '%{NAME}' "$e" 2>/dev/null || true)
+          case $pkg in *'not owned'*|*' '*) pkg= ;; esac
+        fi
+        echo "BIN $(printf '%.12s' "$cid")|$e|$v|$x|$h|$d|$pkg"
       done
     SH
     bins = out.scan(/^BIN (.*)$/).flatten.map do |l|
-      label, exe, go, xnet, h2, godebug = l.split('|', 6)
-      { label: "#{label}:#{File.basename(exe)}", exe: exe, go: go.sub(/\Ago/, ''),
+      cid, exe, go, xnet, h2, godebug, pkg = l.split('|', 7)
+      name = File.basename(exe.to_s)
+      name = "#{name} (#{pkg})" unless pkg.to_s.empty?
+      { container: (cid.to_s.empty? || cid == '-' ? nil : cid), label: name, exe: exe, go: go.sub(/\Ago/, ''),
         xnet: (xnet.nil? || xnet.empty? ? nil : xnet), xnet_http2: h2 == '1', godebug: godebug.to_s }
     end
     { binaries: bins }

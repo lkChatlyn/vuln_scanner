@@ -58,8 +58,9 @@ Options:
 - `-v`: print Cinc Auditor's full output
 - `-p <git-url>`: run rules from a repo without cloning it
 - `-k`: keep the raw JSON report for each target (large, deleted by default)
+- `-f json`: print the results as JSON instead of the table (see below)
 
-The result is the table above. It's also saved as `reports/<timestamp>/summary.tsv` next to the script, along with a `.log` file for any target that errored.
+The result is the table above. It's also saved in `reports/<timestamp>/` next to the script, as `summary.json` and `summary.tsv`, along with a `.log` file for any target that errored.
 
 The exit code is `1` if anything is VULN, PARTIALLY_MITIGATED, UNKNOWN or ERROR, so the script can run from cron or a monitoring check.
 
@@ -69,6 +70,46 @@ To run a single rule against a single container:
 cinc-auditor exec . -t docker://<container> --controls CVE-2026-115560
 ```
 
+## JSON output
+
+`summary.json` is written on every run. With `-f json` it's also printed to stdout instead of the table; progress messages go to stderr, so stdout stays valid JSON:
+
+```bash
+sudo ./scan.sh -f json > result.json
+```
+
+```json
+{
+  "scanner": "vuln_scanner",
+  "profile_version": "1250348",
+  "host": "docker01",
+  "started_at": "2026-11-20T15:39:22Z",
+  "duration_s": 41,
+  "status": "fail",
+  "totals": { "targets": 9, "containers": 10, "counts": { "VULN": 6, "PATCHED": 6, "SKIPPED": 1 } },
+  "targets": [
+    {
+      "name": "shop-web",
+      "display_name": "shop-web (2 replicas)",
+      "kind": "container",
+      "replicas": 2,
+      "container_ids": ["bbb111bbb111", "bbb222bbb222"],
+      "worst": "VULN",
+      "counts": { "VULN": 1 },
+      "results": [
+        { "cve": "CVE-2026-109618", "state": "VULN", "detail": "PHP 8.4.20, fixed in 8.4.27" }
+      ]
+    }
+  ]
+}
+```
+
+- `status`: `fail` when the exit code is 1.
+- `profile_version`: the git commit of the rules.
+- `targets`: sorted worst first. The host is `"name": "_host", "kind": "host"`.
+- `results`: every result except N/A, including MITIGATED and PATCHED, so nothing depends on `-d`. N/A results are included with `-a`.
+- Targets where no rule applies are listed with `"worst": null` and no results.
+
 ## How the rules work
 
 - **Shared facts, read once per target.** Rules don't run commands themselves. They ask a facts resource (`nginx_facts`, `php_facts`, `os_facts`, ...), which reads everything for that product in one shell call and caches it. Adding rules for a product you already check costs almost nothing. A container without any known product costs about 11 quick commands. See [libraries/facts.rb](libraries/facts.rb).
@@ -76,7 +117,7 @@ cinc-auditor exec . -t docker://<container> --controls CVE-2026-115560
 - **Distro packages.** Debian, Ubuntu and Alpine backport fixes without changing the upstream version (Debian's Apache 2.4.62 can be fixed). Where the advisory lists a fixed distro package, the installed package version decides. Vendor packages on another branch, such as nginx.org's own build in the official nginx image, are compared by upstream version instead.
 - **Host-only rules.** Kernel and Go rules run only on the Docker host:
   - Containers share the host kernel.
-  - The host sees every container's processes, including distroless ones without a shell, so it can read the Go version each running binary was built with. The detail names the container: `portainer_agent:agent (go1.25.4)`.
+  - The host sees every container's processes, including distroless ones without a shell, so it can read the Go version each running binary was built with. Each result is filed under the container the binary runs in. Only the host's own binaries (dockerd, containerd and so on) stay under "Docker host", together with the package they came from: `dockerd (docker-ce) (go1.26.5)`.
 - **Conditions in application code** can't be checked, such as "only if the app serves HTTP/2 itself". Those rules report VULN for an unpatched version and add the condition to the detail, e.g. `...; only if the app serves HTTP/2`.
 
 ## Adding a CVE

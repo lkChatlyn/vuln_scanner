@@ -213,10 +213,16 @@ end
 #   VULN      - anything else
 # The worst binary decides the state; the detail names the binaries.
 #
-#   describe go_cve(go_facts.binaries, { '1.27' => '1.27.2', '1.26' => '1.26.9' },
-#                   xnet_fixed: '0.60.0', godebug: ['http2server=0']) do
-#     it { should be_safe }
+#   go_facts.by_container.each do |container, bins|
+#     describe go_cve(bins, { '1.27' => '1.27.2', '1.26' => '1.26.9' },
+#                     xnet_fixed: '0.60.0', godebug: ['http2server=0'], container: container) do
+#       it { should be_safe }
+#     end
 #   end
+#
+# container: the result belongs to that container, not the host. The reason
+# then starts with "[@<container id>] " so scan.sh can file it under the
+# container's own group.
 class GoCve < Inspec.resource(1)
   name 'go_cve'
   desc 'Evaluate a Go CVE across running Go binaries'
@@ -226,6 +232,7 @@ class GoCve < Inspec.resource(1)
   attr_reader :state, :reason
 
   def initialize(binaries, fixed, opts = {})
+    @container = opts[:container]
     xnet_fixed = opts[:xnet_fixed]
     godebug = Array(opts[:godebug])
     groups = { patched: [], mitigated: [], vuln: [] }
@@ -247,7 +254,7 @@ class GoCve < Inspec.resource(1)
       elsif groups[:vuln].any?
         [:vuln, "#{list(groups[:vuln])}; fixed in Go #{fixed.values.join(' / ')}#{xnet_fixed ? " and x/net #{xnet_fixed}" : ''}"]
       elsif groups[:mitigated].any? then [:mitigated, "#{list(groups[:mitigated])}; GODEBUG #{godebug.join(',')}"]
-      else [:patched, "#{groups[:patched].size} Go binaries on fixed versions"]
+      else [:patched, "#{list(groups[:patched])} on fixed Go versions"]
       end
   end
 
@@ -256,7 +263,8 @@ class GoCve < Inspec.resource(1)
   end
 
   def to_s
-    "#{@state.to_s.upcase}: #{@reason}"
+    marker = @container ? "[@#{@container}] " : ''
+    "#{@state.to_s.upcase}: #{marker}#{@reason}"
   end
 
   private
